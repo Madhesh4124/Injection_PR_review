@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "injection-pr-review"
+version = "0.1.0"
+description = "Injection-Robust PR Review Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit", "tests/integration"]
+norecursedirs = ["tests/fixtures", "tests/dev", "tests/frozen", "benchmark"]
+pythonpath = ["."]
+markers = [
+    "integration: marks integration tests that require a running Docker daemon",
+]
+
+[tool.ruff]
+extend-exclude = ["tests/fixtures", "tests/dev", "tests/frozen", "benchmark"]
+target-version = "py311"
+line-length = 100

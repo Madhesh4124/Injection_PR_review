@@ -1,2 +1,37 @@
+# Bytecode and compilation artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing, coverage, and static analysis caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local environment and secret files
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Operating system artifacts
+.DS_Store
+Thumbs.db
+
+# Editor swap files and local IDE metadata
+*.swp
+*~
+.vscode/
+.idea/
+
+# Repository specific ignore rules
 injection_robust_pr_review_agent.md
 .opencode
