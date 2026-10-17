@@ -49,21 +49,22 @@ Untrusted PR Input (Diff, PR Description, Code Files)
    - Runs pinned Semgrep and Bandit scanners strictly against the raw code workspace.
    - Produces immutable scanner findings. The LLM reviewer (Node 3) is never supplied scanner output, preventing adversarial PR content from manipulating or suppressing static analysis.
 3. **LLM-Based Paired Review (Node 3):**
-   - Dispatches review requests to a local Ollama model (`qwen2:1.5b` by default) at temperature `0.0`.
-   - Reviews the raw workspace and stripped workspace independently.
+   - Dispatches review requests to high-context models via Ollama (configured with `num_ctx=32768`) or Hugging Face (`Qwen/Qwen2.5-Coder-7B-Instruct`) at temperature `0.0`.
+   - Reviews the raw workspace and stripped workspace independently using deterministic context budgeting and chunking (`src/detection/context_budget.py`).
+   - Tracks 100% chunk coverage, validating candidate findings and setting `review_complete=False` fail-closed if any chunk fails, truncates, or encounters provider errors.
    - Guarded by resource limits (bounded concurrency, queue limits, monotonic timeouts, transient-only retries).
 4. **Structured Injection Detection (Node 4):**
    - Classifies adversarial prompt injections across diffs, PR descriptions, and README files.
    - Restricted to structured schema output across four fixed classes (`instruction_override`, `authority_claim`, `canary_probe`, `access_probe`). Operates without tool access.
 5. **Canary Payload Inspection & Exposure Telemetry:**
-   - Wire-level inspection evaluates exact serialized HTTP payloads immediately before transmission to the local Ollama daemon.
+   - Wire-level inspection evaluates exact serialized HTTP payloads immediately before transmission to the local Ollama daemon or Hugging Face endpoint.
    - Records non-reversible 128-bit keyed HMAC identifiers rather than raw secrets.
 6. **Discrepancy Validation & Reporting (Node 5):**
    - Computes differential suppression tags: if a vulnerability is detected in the stripped view but omitted in the raw view, suspected suppression is flagged.
    - Evaluates multi-destination exfiltration checks and redacts synthetic secrets across reports, findings, and logs.
    - Emits the final structured JSON report with verified tri-state canary exposure metrics.
 7. **Docker Execution Sandboxing:**
-   - Untrusted fixture test execution runs inside an isolated container with `--network none`, `--cap-drop ALL`, non-root execution (`--user 65534:65534`), resource caps, and a 30-second timeout.
+   - Untrusted fixture test execution runs inside an isolated container with `--network none`, `--cap-drop ALL`, `no-new-privileges`, non-root execution (`--user 1000:1000`), read-only root filesystem (`--read-only`), memory and CPU limits, and automatic container cleanup on failure or timeout.
 8. **Fail-Closed Failure Handling:**
    - If payload inspection fails, outgoing model dispatch is immediately aborted before socket transmission.
    - Discrepancies, missing telemetry, or infrastructure timeouts produce conservative `UNVERIFIED` metrics.
@@ -141,23 +142,34 @@ Production paths utilizing canary telemetry require a cryptographically secure 3
 | `OLLAMA_MAX_INPUT_BYTES` | Integer | `175000` | Input size limit before queue entry |
 | `OLLAMA_MAX_OUTPUT_BYTES` | Integer | `100000` | Maximum stream read limit for model responses |
 
+#### 3. OpenRouter Inference Configuration
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `OPENROUTER_API_KEY` | String | *(None)* | OpenRouter authentication API token |
+| `OPENROUTER_MODEL` | String | `meta-llama/llama-3.3-70b-instruct:free` | Model identifier on OpenRouter |
+| `OPENROUTER_BASE_URL` | String | `https://openrouter.ai/api/v1` | OpenRouter API base endpoint |
+| `OPENROUTER_TIMEOUT_SECONDS` | Float | `60.0` | HTTP request timeout |
+| `OPENROUTER_MAX_RETRIES` | Integer | `3` | Bounded retries for rate limits (429) & server errors (5xx) |
+| `OPENROUTER_REQUEST_BUDGET` | Integer | `50` | Maximum API requests allowed per session |
+| `OPENROUTER_EFFECTIVE_CONTEXT_TOKENS` | Integer | `16384` | Effective verified model context window capacity |
+
 ---
 
 ## Verification Status
 
-### Latest Verification Results (Part 1 Audit)
-According to the latest reported verification audit documented in [`benchmark/results/part1_deployment_verification.md`](benchmark/results/part1_deployment_verification.md):
+### Latest Verification Results (Remediation & Integration Audit)
+According to the latest test suite execution:
 
-| Suite / Verification Check | Scope | Reported Result | Notes |
+| Suite / Verification Check | Scope | Result | Notes |
 | :--- | :--- | :--- | :--- |
-| **Canary Instrumentation Suite** | `tests/unit/test_canary_instrumentation.py` | **20 PASSED** *(historical)* | Covers 128-bit HMAC, fail-closed dispatch, zero secret leaks (0.40s) |
-| **Full Unit Test Suite** | `tests/unit/` | **253 PASSED** *(historical)* | 100% pass rate across all schemas, parsers, tools, and gates (35.37s) |
-| **Static Analysis (Ruff)** | Entire repository | **PASSED** *(historical)* | Zero linting or formatting defects |
-| **Live Ollama Validation** | `scripts/validate_canary_instrumentation.py` | **8 RUNS PASSED** *(historical)* | Zero raw secrets leaked across wire telemetry or final reports |
-| **Docker Integration Tests** | `tests/integration/test_docker_integration.py` | **5 PASSED** *(current session)* | Verified active Docker Engine: 5 passed in 32.55s (separate invocation) |
-| **Live Provider Integration** | `tests/integration/test_live_provider_integration.py` | **8 PASSED** *(current session)* | Verified local Ollama daemon: 8 passed in 44.95s (separate invocation) |
-
-*(Combined integration results: 13 passed across two separate invocations in 77.50s combined elapsed time)*
+| **Full Unit Test Suite** | `tests/unit/` | **329 PASSED** | 100% pass rate across all schemas, unified parsers, security gates, providers, and runners (42.82s) |
+| **Unified JSON Parser Suite** | `tests/unit/test_baseline_json_parser.py` | **11 PASSED** | Balanced brace parsing, fenced blocks, escape recovery, fail-closed handling |
+| **Node 3 & Context Budget Suite** | `tests/unit/test_context_budget_and_paired_reviewer.py` | **18 PASSED** | Context budget, chunking, malformed/schema chunk fail-closed, canary scrubbing, truncation decoupling |
+| **Harness Pipeline Integration** | `tests/unit/test_model_context_and_baseline_gate.py` | **15 PASSED** | Real Nodes 1–5 pipeline execution, scanner unavailability fail-closed, simulation isolation |
+| **OpenRouter Provider Suite** | `tests/unit/test_openrouter_provider.py` | **8 PASSED** | Auth, model selection, rate-limits, request budget, secret redaction |
+| **Docker Integration Tests** | `tests/integration/test_docker_integration.py` | **13 PASSED** | 12 security controls verified in active Docker engine (51.89s) |
+| **Dev Baseline Resilience Gate** | `scripts/run_dev_baseline.py` | **SIMULATED ONLY** | 6 pairs pass in simulation mode; live provider gate run remains pending |
 
 ### Audit Verdict
 **`PASS WITH LIMITATIONS`**

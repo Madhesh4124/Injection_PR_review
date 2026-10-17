@@ -17,6 +17,11 @@ from src.materialization.path_safety import (
     validate_file_content_limits,
 )
 from src.materialization.stripper import StrippingFileResult, strip_file_content
+from src.materialization.unicode_sanitizer import (
+    UnicodeAnnotation,
+    detect_unicode_anomalies,
+    sanitize_file_unicode,
+)
 
 README_PATTERN = re.compile(r"^README(\.[a-zA-Z0-9]+)?$", re.IGNORECASE)
 GIT_METADATA_NAMES = {".git", ".gitignore", ".gitattributes", ".gitmodules"}
@@ -37,6 +42,8 @@ class WorkspacePair(BaseModel):
     syntax_errors: List[str] = Field(default_factory=list)
     pr_description_excluded: bool = Field(default=True)
     file_results: List[StrippingFileResult] = Field(default_factory=list)
+    unicode_annotations: List[UnicodeAnnotation] = Field(default_factory=list)
+    unicode_anomalies_count: int = Field(default=0)
 
 
 def compute_workspace_hash(workspace_root: Path) -> str:
@@ -154,12 +161,19 @@ def materialize_workspaces(
     _copy_clean_tree(base_source_dir, raw_dir)
     apply_patch_to_workspace(raw_dir, patch_content)
 
-    # Validate limits across all raw files
+    # Validate limits across all raw files & collect Unicode annotations
+    all_unicode_annotations: List[UnicodeAnnotation] = []
+    total_unicode_anomalies: int = 0
     for dirpath, _, filenames in os.walk(raw_dir):
-        for fname in filenames:
+        for fname in sorted(filenames):
             fpath = Path(dirpath) / fname
             content_bytes = fpath.read_bytes()
-            validate_file_content_limits(content_bytes, fpath.relative_to(raw_dir).as_posix())
+            rel_p = fpath.relative_to(raw_dir).as_posix()
+            validate_file_content_limits(content_bytes, rel_p)
+            _, u_res = sanitize_file_unicode(content_bytes, rel_p)
+            if u_res.annotations:
+                all_unicode_annotations.extend(u_res.annotations)
+                total_unicode_anomalies += u_res.anomalies_count
 
     initial_raw_hash = compute_workspace_hash(raw_dir)
 
@@ -194,9 +208,12 @@ def materialize_workspaces(
             elif result.syntax_error:
                 syntax_errors.append(f"{rel_path}: {result.syntax_error}")
 
-            if stripped_bytes != original_bytes:
+            # Apply Unicode sanitization to the stripped view to neutralize residual dangerous controls
+            sanitized_bytes, _ = sanitize_file_unicode(stripped_bytes, rel_path)
+
+            if sanitized_bytes != original_bytes:
                 stripped_files.append(rel_path)
-                fpath.write_bytes(stripped_bytes)
+                fpath.write_bytes(sanitized_bytes)
 
     stripped_hash = compute_workspace_hash(stripped_dir)
 
@@ -221,6 +238,8 @@ def materialize_workspaces(
         syntax_errors=syntax_errors,
         pr_description_excluded=True,
         file_results=file_results,
+        unicode_annotations=all_unicode_annotations,
+        unicode_anomalies_count=total_unicode_anomalies,
     )
 
 

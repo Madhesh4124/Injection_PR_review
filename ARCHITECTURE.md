@@ -48,6 +48,32 @@ index, call index), and retry+log rate-limit failures (never score as a miss).
 Disable caching for evaluation runs; use caching only for retries and dev.**
 Deterministic paths, matching, scanning, and scoring do not use an LLM.
 
+### Model Context Window & Provider Architecture
+To accommodate the 2,500-line / 125 KB PR limit without silent context truncation:
+- **High-Context Window Requirement:** The LLM provider must be configured with a context window of at least 32,768 tokens (`num_ctx=32768`).
+- **Context Budgeting & Deterministic Chunking (`src/detection/context_budget.py`):**
+  - Conservative token estimation: 1 token ≈ 3 characters + 15% safety buffer for code/diffs.
+  - Context reserve calculation: reserves tokens for system prompt (1,500), output generation (4,096), PR metadata (1,000), tool results (2,048), and safety margin (500).
+  - Deterministic chunking: when diff exceeds available content budget, diffs are chunked file-by-file (and hunk-by-hunk if individual files exceed budget).
+  - PRD context limits: strictly enforces 500 lines or 25 KB per file and 2,500 lines or 125 KB per PR.
+- **Node 3 Paired Reviewer (`src/detection/paired_reviewer.py`):**
+  - Evaluates Raw View (Node 3A) and Stripped View (Node 3B) independently with identical prompts.
+  - Requires 100% chunk coverage across all planned chunk IDs (`required_chunk_ids`).
+  - If any chunk fails, times out, or triggers provider errors, `review_complete=False` and `unreviewed_files_truncated=True` are set fail-closed.
+  - Validates and normalizes all candidate findings against authorized workspaces (`validate_and_normalize_finding`), rejecting non-existent files and out-of-bounds line numbers.
+- **Ollama Provider (`OllamaProvider`):** Configurable via `OLLAMA_NUM_CTX` (default 32768). Explicitly passes `num_ctx` in `/api/generate` options, validates pre-flight token estimates, and monitors `prompt_eval_count`, `truncated`, and `done_reason` to raise `OllamaOversizedInputError` on context overflow.
+- **OpenRouter Provider (`OpenRouterProvider`):** Integration with OpenRouter API (`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_BASE_URL`), configurable context limits (`effective_context_tokens`), configurable request budget (`OPENROUTER_REQUEST_BUDGET`), bounded retries with `Retry-After` header parsing, and fail-closed secret redaction (stripping API keys from all error and exception messages).
+- **Hugging Face Provider (`HuggingFaceProvider`):** Direct integration via `huggingface_hub.InferenceClient` (with HTTP fallback), defaulting to high-context instruction models (e.g., `Qwen/Qwen2.5-Coder-7B-Instruct` or `Llama-3.1-8B-Instruct`). Enforces pre-flight token checks, checks `finish_reason` for generation/context limits, and enforces transient retries (429, 503).
+- **NVIDIA NIM Provider (`NIMProvider`):** OpenAI-compatible hosted NIM inference with model configuration (`NIM_MODEL`), configurable context window, and authentication (`NIM_API_KEY`).
+- **Authoritative Hardened JSON Parser (`src/evaluation/json_parser.py`):** Multi-stage resilient JSON extractor replacing regex matching across both baseline (`src/evaluation/baseline.py`) and Node 3 Paired Reviewer (`src/detection/paired_reviewer.py`). Implements balanced-brace boundary tracking, markdown fenced code block extraction, non-standard escape sequence recovery (`\x` -> `x`), and category normalization (`VulnerabilityCategory`). Ensures malformed, truncated, or schema-invalid responses fail closed rather than silently yielding an empty finding list. In Node 3, parsing errors set `review_complete=False` and preserve chunk attribution with canary/secret redaction.
+- **Evaluation Harness Pipeline Integration (`src/evaluation/harness.py`):** `FrozenEvaluationHarness` directly connects real pipeline components: Node 1 (workspace materialization & comment/docstring stripping via `strip_file_content`), Node 2 (`run_all_scanners`), Node 3 (`Node3PairedReviewer`), Node 4 (`Node4InjectionDetector`), and Node 5 (`Node5Reporter`). Reconciles deterministic scanner and LLM findings according to established precedence. Distinguishes live execution from simulation through explicit `use_simulation` configuration (`_run_baseline_fixture_simulated` / `_run_defended_fixture_simulated` marked with provenance tags).
+- **Hosted Inference Privacy & Canary Telemetry:** Before any serialized payload is dispatched to a remote LLM API, `CanaryPayloadInspector` scans the payload byte-for-byte. If unredacted canary secrets or sensitive host credentials appear, dispatch is blocked fail-closed (`OllamaCanaryInspectionError` / `HuggingFaceCanaryInspectionError` / `OpenRouterCanaryInspectionError`).
+- **Development Baseline Resilience Gate (`scripts/run_dev_baseline.py`):**
+  - Evaluates unhardened baseline behavior on `tests/dev/` twin scenarios.
+  - Supports live provider invocation (`--provider openrouter`, `--provider ollama`, `--provider huggingface`, `--provider nim`) and offline simulation (`--provider simulated`).
+  - Employs composite SHA-256 caching (`model:fixture_id:patch:description`) within the current run to prevent stale cross-contamination between models and inputs.
+  - Flushed, real-time progress reporting.
+
 Context limits are 500 lines or 25 KB per file and 2,500 lines or 125 KB per
 PR. A limit breach records omitted material and sets
 `review_complete=false`. Finding matching requires the same relative path,
@@ -169,6 +195,28 @@ One tag per finding. `kind` is an enum:
 
 Fields `line_shift` and `category_mismatch` are present only when
 `kind="matched_shifted"`.
+
+### Unicode Annotation
+
+```json
+{
+  "path": "auth.py",
+  "line_number": 12,
+  "column": 4,
+  "codepoint": "U+202E",
+  "character_name": "RIGHT-TO-LEFT OVERRIDE",
+  "unicode_category": "Cf",
+  "context": "comment",
+  "reason": "Trojan Source bidirectional text override",
+  "action": "neutralized"
+}
+```
+
+`path` is repository-relative. `line_number` and `column` are 1-based and 0-based
+positions respectively. `action` is `neutralized` (replaced with ASCII space in
+stripped/analysis view) or `annotated` (preserved in original source/executable
+code to prevent unintended semantic mutation). Surrounding source secrets/canaries
+are never captured in annotations.
 
 ### Final Report
 
@@ -368,10 +416,9 @@ The source specification names the technologies but does not provide exact
 versions. Exact pins must be lockfile-derived and recorded as `TBD` until
 locked; do not invent values:
 
-- LangGraph: `TBD (lockfile-derived)`
-- LangChain: `TBD (lockfile-derived)`
+- Orchestration: Custom multi-node directed pipeline (no LangGraph dependency)
 - Python: `TBD (lockfile-derived)`
-- Gemini/Groq client: `TBD (lockfile-derived)`
+- Supported providers: Ollama, OpenRouter, Hugging Face, NVIDIA NIM
 - Semgrep and local rule pack: `TBD (lockfile/ruleset-derived)`
 - Bandit and local rule pack: `TBD (lockfile/ruleset-derived)`
 - Docker image digest: `TBD (lockfile/build-derived)`
@@ -384,8 +431,8 @@ digest, benchmark tag, checker commit, and matching-logic version.
 
 ## Technology stack
 
-- Orchestration: LangGraph and LangChain.
-- LLM engine: Gemini or Groq API client.
+- Orchestration: Custom deterministic multi-node pipeline coordinating Nodes 1–5.
+- LLM engine: OpenRouter, Ollama, Hugging Face, or NVIDIA NIM client adapters.
 - Static analysis: Semgrep and Bandit with local pinned rule packs.
 - Diff and code parsing: Python `ast`, `tokenize`, `difflib`, and `pathlib`.
 - Sandboxed execution: Docker with an ephemeral writable workspace.

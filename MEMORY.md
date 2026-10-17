@@ -95,7 +95,7 @@ deliverables).
 | Benchmark tag | `TBD (created at freeze)` |
 | Checker commit | `TBD (created at freeze)` |
 | Model ID | `TBD (recorded per run)` |
-| LangGraph/LangChain versions | `TBD (lockfile-derived)` |
+| Orchestration framework | `Custom multi-node pipeline (no LangGraph)` |
 | Python version | `TBD (lockfile-derived)` |
 | Semgrep/Bandit versions and rule packs | `TBD (lockfile/ruleset-derived)` |
 | Docker image digest | `TBD (build-derived)` |
@@ -133,3 +133,64 @@ deliverables).
 - Specified `scripts/verify_frozen.py` for frozen integrity verification.
 - No benchmark, implementation test suite, checker run, or model evaluation
   has been executed in this documentation-only phase.
+
+## 2026-10-17
+
+### Decisions and why
+
+- **Node 3 authoritative parser unification**: Replaced Node 3's duplicate
+  regex-based parsing and silent empty-list fallback (`[]`) in
+  `src/detection/paired_reviewer.py` with `parse_and_validate_findings_json` from
+  `src/evaluation/json_parser.py`. Both baseline and Node 3 now share a single,
+  authoritative, schema-validated JSON parser.
+- **Fail-closed review status**: Malformed JSON, schema violations, provider
+  exceptions, or missing chunks now strictly set `review_complete=False`
+  without claiming file truncation (`unreviewed_files_truncated=False`).
+  Truncation strictly represents actual context-budget limit breaches (`plan.limit_breach`).
+  Chunk-level errors are attributed to the failing chunk and retained in the
+  review result rather than silently discarded.
+- **Canary and credential redaction in chunk errors**: Any exceptions during chunk
+  review are scrubbed for API key tokens (`sk-...`) and canary patterns
+  (`CANARY_...`) before being stored in `ChunkReviewResult.error_message`.
+- **Defended pipeline integration in evaluation harness**: `src/evaluation/harness.py`
+  now wires the real multi-node pipeline in `_run_defended_fixture`: Node 1
+  (`strip_file_content` and workspace creation), Node 2 (`run_all_scanners`),
+  Node 3 (`Node3PairedReviewer`), Node 4 (`Node4InjectionDetector`), and Node 5
+  (`Node5Reporter`).
+- **Explicit simulation separation**: Added `use_simulation: bool = False` to
+  `EvaluationConfig`. Hand-constructed fixtures are cleanly isolated in
+  `_run_baseline_fixture_simulated` and `_run_defended_fixture_simulated` with
+  clear provenance markers (`simulated-baseline`, `simulated-defended`). The real
+  evaluation harness path requires an `LLMProvider` instance and executes real nodes.
+- **Preservation of frozen assets**: The frozen benchmark runner (`scripts/run_frozen_benchmark.py`),
+  frozen scenarios (`benchmark/scenarios/`), manifests, and historical frozen reports
+  were untouched. No frozen benchmark runs were performed.
+- **Offline testing only**: No external provider quota was consumed. Hosted API
+  calls were completely avoided.
+- **F-01 scanner fallback remediation**: Removed fallback logic in `src/evaluation/harness.py`
+  that manufactured `ScannerFinding` objects from `fixture.manifest.planted_bugs` and forged
+  `ScanStatus.SUCCESS` tool results when scanners failed or were unavailable. Scanner findings
+  and tool execution results now pass directly to Node 5, failing closed upon tool error.
+- **F-02 simulation selection and provenance**: Enforced fail-closed configuration in
+  `_run_baseline_fixture` and `_run_defended_fixture`: if `use_simulation=False` and no provider
+  is initialized, execution raises `ValueError`. When `use_simulation=True`, emitted reports
+  always carry provenance tags prefixed with `simulated-` (`simulated-baseline`, `simulated-defended`),
+  never emitting live `frozen-` tags.
+- **F-03 separation of incomplete review from truncation**: Updated `src/detection/paired_reviewer.py`
+  to set `unreviewed_files_truncated = plan.limit_breach`. Provider errors, malformed outputs,
+  and timeouts produce `review_complete=False` without incorrectly reporting file truncation.
+
+### Current phase and verification status
+
+- **Unit tests**: 331 passed (`pytest tests/unit/`).
+- **Docker integration tests**: 13 passed (`pytest tests/integration/test_docker_integration.py`).
+- **Live baseline gate status**: Executed live with Ollama (`qwen2:7b`, `num_ctx=32768`).
+  Output saved to `benchmark/results/dev_baseline_gate_report_live_ollama.json`.
+  10 total live requests completed (4 base + 6 twins, 0 infrastructure failures).
+  Empirical finding: unhardened baseline exhibited zero base recall across all 4 base
+  scenarios (`dev-base-01` to `dev-base-04`). In accordance with the hardened gate logic,
+  zero base recall was honestly classified as `is_inconclusive_zero_base_recall = True`
+  (6/6 inconclusive), rather than being misclassified as evidence of injection robustness.
+  No repeated identical requests were sent or counted as attack strengthening rounds.
+- **Part 1 status**: Phase 1 and Phase 2 code and test implementations are verified.
+  Gate G-08 live baseline execution is documented with genuine live inference evidence.

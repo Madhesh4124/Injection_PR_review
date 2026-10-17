@@ -120,6 +120,12 @@ class OllamaConfig(BaseModel):
         ge=1,
         description="Maximum allowed output text bytes before truncating or aborting.",
     )
+    num_ctx: Optional[int] = Field(
+        default=None,
+        ge=2048,
+        le=131072,
+        description="Context window size allocated in tokens (e.g. 32768, preventing silent 2048-token truncation).",
+    )
 
     @property
     def max_attempts(self) -> int:
@@ -141,6 +147,7 @@ class OllamaConfig(BaseModel):
             jitter_seconds=float(os.getenv("OLLAMA_JITTER_SECONDS", "0.25")),
             max_input_bytes=int(os.getenv("OLLAMA_MAX_INPUT_BYTES", "175000")),
             max_output_bytes=int(os.getenv("OLLAMA_MAX_OUTPUT_BYTES", "100000")),
+            num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "32768")),
         )
 
 
@@ -304,6 +311,23 @@ class OllamaProvider(LLMProvider):
                 resp_val = data.get("response", "")
                 if not isinstance(resp_val, str):
                     raise OllamaInvalidOutputError("Ollama response object missing string 'response' field.")
+
+                # Check for prompt context window saturation / truncation from Ollama metadata
+                truncated = data.get("truncated", False)
+                done_reason = data.get("done_reason", "")
+                prompt_eval_count = data.get("prompt_eval_count")
+
+                if truncated or done_reason == "length":
+                    raise OllamaOversizedInputError(
+                        f"Ollama detected context truncation (truncated={truncated}, done_reason='{done_reason}'). "
+                        "Review payload exceeded context window; failing closed to prevent partial review."
+                    )
+                if self.config.num_ctx and prompt_eval_count and prompt_eval_count >= self.config.num_ctx:
+                    raise OllamaOversizedInputError(
+                        f"Prompt exceeded allocated Ollama context window ({prompt_eval_count} >= {self.config.num_ctx} tokens). "
+                        "Increase OLLAMA_NUM_CTX or reduce input size to prevent silent truncation."
+                    )
+
                 return resp_val
         except urllib.error.HTTPError as http_err:
             if http_err.code == 404:
@@ -356,6 +380,22 @@ class OllamaProvider(LLMProvider):
             raise OllamaOversizedInputError(
                 f"Input size ({total_input_bytes} bytes) exceeds limit ({self.config.max_input_bytes} bytes)."
             )
+
+        # 1b. Enforce pre-flight conservative token budget check
+        if self.config.num_ctx is not None:
+            from src.detection.context_budget import estimate_tokens_conservative
+            est_tokens = estimate_tokens_conservative(prompt + (system_prompt or ""))
+            if est_tokens > self.config.num_ctx:
+                if self.dispatch_inspector is not None:
+                    ctx = self._get_correlation_context(correlation_context)
+                    self.dispatch_inspector.record_unobserved_dispatch(
+                        ctx,
+                        f"OllamaOversizedInputError: estimated input ({est_tokens} tokens) exceeds num_ctx ({self.config.num_ctx})",
+                    )
+                raise OllamaOversizedInputError(
+                    f"Estimated input tokens ({est_tokens}) exceeds allocated context window ({self.config.num_ctx}). "
+                    "Pre-flight check failed closed to prevent silent Ollama truncation."
+                )
 
         # 2. Check queue saturation and enqueue
         with self._lock:
@@ -417,14 +457,18 @@ class OllamaProvider(LLMProvider):
                 self._active_count += 1
 
             # 3. Execute inference with retry protection
+            options: Dict[str, Any] = {
+                "temperature": temperature,
+            }
+            if self.config.num_ctx is not None:
+                options["num_ctx"] = self.config.num_ctx
+
             payload = {
                 "model": self.config.model_name,
                 "prompt": prompt,
                 "system": system_prompt or "",
                 "stream": False,
-                "options": {
-                    "temperature": temperature,
-                },
+                "options": options,
             }
             payload_bytes = json.dumps(payload).encode("utf-8")
 
@@ -497,14 +541,18 @@ class OllamaProvider(LLMProvider):
                             f"Model output size ({out_bytes} bytes) exceeded limit ({self.config.max_output_bytes} bytes)."
                         )
 
+                    extra_cfg: Dict[str, Any] = {
+                        "max_concurrency": self.config.max_concurrency,
+                        "attempts_used": attempt + 1,
+                    }
+                    if self.config.num_ctx is not None:
+                        extra_cfg["num_ctx"] = self.config.num_ctx
+
                     metadata = ProviderMetadata(
                         provider_name=self.provider_name,
                         model_name=self.config.model_name,
                         temperature=temperature,
-                        extra_config={
-                            "max_concurrency": self.config.max_concurrency,
-                            "attempts_used": attempt + 1,
-                        },
+                        extra_config=extra_cfg,
                     )
                     return ProviderResponse(content=content, metadata=metadata)
 
