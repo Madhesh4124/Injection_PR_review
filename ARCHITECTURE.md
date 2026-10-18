@@ -62,15 +62,14 @@ To accommodate the 2,500-line / 125 KB PR limit without silent context truncatio
   - If any chunk fails, times out, or triggers provider errors, `review_complete=False` and `unreviewed_files_truncated=True` are set fail-closed.
   - Validates and normalizes all candidate findings against authorized workspaces (`validate_and_normalize_finding`), rejecting non-existent files and out-of-bounds line numbers.
 - **Ollama Provider (`OllamaProvider`):** Configurable via `OLLAMA_NUM_CTX` (default 32768). Explicitly passes `num_ctx` in `/api/generate` options, validates pre-flight token estimates, and monitors `prompt_eval_count`, `truncated`, and `done_reason` to raise `OllamaOversizedInputError` on context overflow.
-- **OpenRouter Provider (`OpenRouterProvider`):** Integration with OpenRouter API (`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_BASE_URL`), configurable context limits (`effective_context_tokens`), configurable request budget (`OPENROUTER_REQUEST_BUDGET`), bounded retries with `Retry-After` header parsing, and fail-closed secret redaction (stripping API keys from all error and exception messages).
 - **Hugging Face Provider (`HuggingFaceProvider`):** Direct integration via `huggingface_hub.InferenceClient` (with HTTP fallback), defaulting to high-context instruction models (e.g., `Qwen/Qwen2.5-Coder-7B-Instruct` or `Llama-3.1-8B-Instruct`). Enforces pre-flight token checks, checks `finish_reason` for generation/context limits, and enforces transient retries (429, 503).
 - **NVIDIA NIM Provider (`NIMProvider`):** OpenAI-compatible hosted NIM inference with model configuration (`NIM_MODEL`), configurable context window, and authentication (`NIM_API_KEY`).
 - **Authoritative Hardened JSON Parser (`src/evaluation/json_parser.py`):** Multi-stage resilient JSON extractor replacing regex matching across both baseline (`src/evaluation/baseline.py`) and Node 3 Paired Reviewer (`src/detection/paired_reviewer.py`). Implements balanced-brace boundary tracking, markdown fenced code block extraction, non-standard escape sequence recovery (`\x` -> `x`), and category normalization (`VulnerabilityCategory`). Ensures malformed, truncated, or schema-invalid responses fail closed rather than silently yielding an empty finding list. In Node 3, parsing errors set `review_complete=False` and preserve chunk attribution with canary/secret redaction.
 - **Evaluation Harness Pipeline Integration (`src/evaluation/harness.py`):** `FrozenEvaluationHarness` directly connects real pipeline components: Node 1 (workspace materialization & comment/docstring stripping via `strip_file_content`), Node 2 (`run_all_scanners`), Node 3 (`Node3PairedReviewer`), Node 4 (`Node4InjectionDetector`), and Node 5 (`Node5Reporter`). Reconciles deterministic scanner and LLM findings according to established precedence. Distinguishes live execution from simulation through explicit `use_simulation` configuration (`_run_baseline_fixture_simulated` / `_run_defended_fixture_simulated` marked with provenance tags).
-- **Hosted Inference Privacy & Canary Telemetry:** Before any serialized payload is dispatched to a remote LLM API, `CanaryPayloadInspector` scans the payload byte-for-byte. If unredacted canary secrets or sensitive host credentials appear, dispatch is blocked fail-closed (`OllamaCanaryInspectionError` / `HuggingFaceCanaryInspectionError` / `OpenRouterCanaryInspectionError`).
+- **Hosted Inference Privacy & Canary Telemetry:** Before any serialized payload is dispatched to a remote LLM API, `CanaryPayloadInspector` scans the payload byte-for-byte. If unredacted canary secrets or sensitive host credentials appear, dispatch is blocked fail-closed (`OllamaCanaryInspectionError` / `HuggingFaceCanaryInspectionError`).
 - **Development Baseline Resilience Gate (`scripts/run_dev_baseline.py`):**
   - Evaluates unhardened baseline behavior on `tests/dev/` twin scenarios.
-  - Supports live provider invocation (`--provider openrouter`, `--provider ollama`, `--provider huggingface`, `--provider nim`) and offline simulation (`--provider simulated`).
+  - Supports live provider invocation (`--provider ollama`, `--provider huggingface`, `--provider nim`) and offline simulation (`--provider simulated`).
   - Employs composite SHA-256 caching (`model:fixture_id:patch:description`) within the current run to prevent stale cross-contamination between models and inputs.
   - Flushed, real-time progress reporting.
 
@@ -418,7 +417,7 @@ locked; do not invent values:
 
 - Orchestration: Custom multi-node directed pipeline (no LangGraph dependency)
 - Python: `TBD (lockfile-derived)`
-- Supported providers: Ollama, OpenRouter, Hugging Face, NVIDIA NIM
+- Supported providers: Ollama (primary live inference engine), Hugging Face, NVIDIA NIM
 - Semgrep and local rule pack: `TBD (lockfile/ruleset-derived)`
 - Bandit and local rule pack: `TBD (lockfile/ruleset-derived)`
 - Docker image digest: `TBD (lockfile/build-derived)`
@@ -432,7 +431,7 @@ digest, benchmark tag, checker commit, and matching-logic version.
 ## Technology stack
 
 - Orchestration: Custom deterministic multi-node pipeline coordinating Nodes 1–5.
-- LLM engine: OpenRouter, Ollama, Hugging Face, or NVIDIA NIM client adapters.
+- LLM engine: Local Ollama (primary live inference engine), Hugging Face, or NVIDIA NIM client adapters.
 - Static analysis: Semgrep and Bandit with local pinned rule packs.
 - Diff and code parsing: Python `ast`, `tokenize`, `difflib`, and `pathlib`.
 - Sandboxed execution: Docker with an ephemeral writable workspace.

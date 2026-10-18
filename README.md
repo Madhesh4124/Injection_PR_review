@@ -142,18 +142,6 @@ Production paths utilizing canary telemetry require a cryptographically secure 3
 | `OLLAMA_MAX_INPUT_BYTES` | Integer | `175000` | Input size limit before queue entry |
 | `OLLAMA_MAX_OUTPUT_BYTES` | Integer | `100000` | Maximum stream read limit for model responses |
 
-#### 3. OpenRouter Inference Configuration
-
-| Variable | Type | Default | Description |
-|---|---|---|---|
-| `OPENROUTER_API_KEY` | String | *(None)* | OpenRouter authentication API token |
-| `OPENROUTER_MODEL` | String | `meta-llama/llama-3.3-70b-instruct:free` | Model identifier on OpenRouter |
-| `OPENROUTER_BASE_URL` | String | `https://openrouter.ai/api/v1` | OpenRouter API base endpoint |
-| `OPENROUTER_TIMEOUT_SECONDS` | Float | `60.0` | HTTP request timeout |
-| `OPENROUTER_MAX_RETRIES` | Integer | `3` | Bounded retries for rate limits (429) & server errors (5xx) |
-| `OPENROUTER_REQUEST_BUDGET` | Integer | `50` | Maximum API requests allowed per session |
-| `OPENROUTER_EFFECTIVE_CONTEXT_TOKENS` | Integer | `16384` | Effective verified model context window capacity |
-
 ---
 
 ## Verification Status
@@ -163,11 +151,11 @@ According to the latest test suite execution:
 
 | Suite / Verification Check | Scope | Result | Notes |
 | :--- | :--- | :--- | :--- |
-| **Full Unit Test Suite** | `tests/unit/` | **329 PASSED** | 100% pass rate across all schemas, unified parsers, security gates, providers, and runners (42.82s) |
+| **Full Unit Test Suite** | `tests/unit/` | **347 PASSED** | 100% pass rate across all schemas, unified parsers, security gates, providers, and runners |
 | **Unified JSON Parser Suite** | `tests/unit/test_baseline_json_parser.py` | **11 PASSED** | Balanced brace parsing, fenced blocks, escape recovery, fail-closed handling |
 | **Node 3 & Context Budget Suite** | `tests/unit/test_context_budget_and_paired_reviewer.py` | **18 PASSED** | Context budget, chunking, malformed/schema chunk fail-closed, canary scrubbing, truncation decoupling |
 | **Harness Pipeline Integration** | `tests/unit/test_model_context_and_baseline_gate.py` | **15 PASSED** | Real Nodes 1–5 pipeline execution, scanner unavailability fail-closed, simulation isolation |
-| **OpenRouter Provider Suite** | `tests/unit/test_openrouter_provider.py` | **8 PASSED** | Auth, model selection, rate-limits, request budget, secret redaction |
+| **Ollama Provider Suites** | `tests/unit/test_ollama_*.py` | **19 PASSED** | Concurrency controls, semaphore bounds, fast queue rejection, timeout bounds |
 | **Docker Integration Tests** | `tests/integration/test_docker_integration.py` | **13 PASSED** | 12 security controls verified in active Docker engine (51.89s) |
 | **Dev Baseline Resilience Gate** | `scripts/run_dev_baseline.py` | **SIMULATED ONLY** | 6 pairs pass in simulation mode; live provider gate run remains pending |
 

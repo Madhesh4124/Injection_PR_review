@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.detection.huggingface_provider import HuggingFaceConfig, HuggingFaceProvider
 from src.detection.nim_provider import NIMConfig, NIMProvider
 from src.detection.ollama_provider import OllamaConfig, OllamaProvider
-from src.detection.openrouter_provider import OpenRouterConfig, OpenRouterProvider
 from src.evaluation.checker import load_development_fixtures, run_development_baseline_evaluation
 
 
@@ -27,7 +26,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run Phase 2 Development Baseline Evaluation Gate.")
     parser.add_argument(
         "--provider",
-        choices=["ollama", "huggingface", "nim", "openrouter", "simulated"],
+        choices=["ollama", "huggingface", "nim", "simulated"],
         default="simulated",
         help="Inference provider for live evaluation (default: simulated).",
     )
@@ -101,22 +100,6 @@ def main() -> None:
             )
         print(f"Using NVIDIA NIM provider: model={nim_cfg.model_name}, context_tokens={nim_cfg.max_context_tokens}, url={nim_cfg.base_url}")
         live_provider = NIMProvider(config=nim_cfg)
-    elif args.provider == "openrouter":
-        or_cfg = OpenRouterConfig.from_env()
-        if args.model:
-            or_cfg = OpenRouterConfig(
-                api_key=or_cfg.api_key,
-                base_url=or_cfg.base_url,
-                model_name=args.model,
-                max_context_tokens=or_cfg.max_context_tokens,
-                max_tokens=or_cfg.max_tokens,
-                site_url=or_cfg.site_url,
-                site_name=or_cfg.site_name,
-                timeout_seconds=args.timeout,
-                max_retries=or_cfg.max_retries,
-            )
-        print(f"Using OpenRouter provider: model={or_cfg.model_name}, context_tokens={or_cfg.max_context_tokens}, url={or_cfg.base_url}")
-        live_provider = OpenRouterProvider(config=or_cfg)
     else:
         print("Using offline simulated unhardened baseline reviewer.")
 

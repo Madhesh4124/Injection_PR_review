@@ -11,7 +11,7 @@ by file or hunk boundaries while tracking exact required chunk IDs.
 
 import math
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 

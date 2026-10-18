@@ -30,7 +30,6 @@ from src.matching.engine import CaseMatchSummary, evaluate_final_report
 from src.reporting.canary_redactor import CanaryConfig
 from src.reporting.reporter import Node5Reporter
 from src.sandbox.docker_runner import PINNED_SANDBOX_IMAGE
-from src.scanning.models import ScanResult, ScanStatus
 from src.scanning.runner import run_all_scanners
 from src.schemas.findings import Finding, ScannerFinding
 from src.schemas.fixture import FixtureDefinition, ScenarioCategory
@@ -890,10 +889,12 @@ class FrozenEvaluationHarness:
 
         # 1. Node 1: Materialize dual workspaces (Raw and Stripped)
         patched_files = self._extract_files_from_diff(fixture.patch_content, fixture)
+        readme_text: Optional[str] = None
         for rel_path, content in patched_files.items():
             fname = Path(rel_path).name
             if re.match(r"^README(\.[a-zA-Z0-9]+)?$", fname, re.IGNORECASE):
                 # Raw view has README, stripped view omits README
+                readme_text = content
                 raw_target = raw_ws / rel_path
                 raw_target.parent.mkdir(parents=True, exist_ok=True)
                 raw_target.write_text(content, encoding="utf-8")
@@ -913,26 +914,49 @@ class FrozenEvaluationHarness:
         scan_output = run_all_scanners(raw_ws)
         scanner_findings: List[ScannerFinding] = list(scan_output.scanner_findings)
 
-        # 3. Node 3: Real Paired Reviewer (Raw view and Stripped view)
-        paired_reviewer = Node3PairedReviewer(provider=self.provider)
-        paired_res = paired_reviewer.review_paired(
-            raw_workspace=raw_ws,
-            stripped_workspace=stripped_ws,
-            raw_diff=fixture.patch_content,
-            stripped_diff=fixture.patch_content,
-            pr_description=fixture.pr_description,
-            readme_content=None,
+        # Canary Configuration and Live Telemetry Session (wired to provider for wire-level inspection)
+        canary_conf = CanaryConfig()
+        from src.detection.canary_telemetry import (
+            DEFAULT_CANARIES,
+            CanaryExposureSession,
+            CanaryPayloadInspector,
         )
-
-        # 4. Node 4: Structured Injection Detection
-        detector = Node4InjectionDetector(provider=self.provider)
-        det_res = detector.detect_injections(
-            raw_diff=fixture.patch_content,
-            pr_description=fixture.pr_description,
-            readme_content=None,
+        inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+        session = CanaryExposureSession(
             scenario_id=fixture.fixture_id,
             run_index=run_idx,
+            inspector=inspector,
+            expected_min_dispatches=1 if fixture.scenario_category in (ScenarioCategory.TWIN, ScenarioCategory.CANARY) else 0,
         )
+
+        orig_inspector = getattr(self.provider, "dispatch_inspector", None)
+        if hasattr(self.provider, "dispatch_inspector"):
+            self.provider.dispatch_inspector = inspector
+
+        try:
+            # 3. Node 3: Real Paired Reviewer (Raw view and Stripped view)
+            paired_reviewer = Node3PairedReviewer(provider=self.provider)
+            paired_res = paired_reviewer.review_paired(
+                raw_workspace=raw_ws,
+                stripped_workspace=stripped_ws,
+                raw_diff=fixture.patch_content,
+                stripped_diff=fixture.patch_content,
+                pr_description=fixture.pr_description,
+                readme_content=readme_text,
+            )
+
+            # 4. Node 4: Structured Injection Detection
+            detector = Node4InjectionDetector(provider=self.provider)
+            det_res = detector.detect_injections(
+                raw_diff=fixture.patch_content,
+                pr_description=fixture.pr_description,
+                readme_content=readme_text,
+                scenario_id=fixture.fixture_id,
+                run_index=run_idx,
+            )
+        finally:
+            if hasattr(self.provider, "dispatch_inspector"):
+                self.provider.dispatch_inspector = orig_inspector
 
         # 5. Blocked Access Telemetry
         blocked_access = BlockedAccess(tool_unit=[], behavioral=[])
@@ -948,21 +972,6 @@ class FrozenEvaluationHarness:
                 behavioral=[],
             )
 
-        # 6. Canary Configuration and Live Telemetry Session
-        canary_conf = CanaryConfig()
-        from src.detection.canary_telemetry import (
-            DEFAULT_CANARIES,
-            CanaryExposureSession,
-            CanaryPayloadInspector,
-        )
-        inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
-        session = CanaryExposureSession(
-            scenario_id=fixture.fixture_id,
-            run_index=run_idx,
-            inspector=inspector,
-            expected_min_dispatches=1 if fixture.scenario_category in (ScenarioCategory.TWIN, ScenarioCategory.CANARY) else 0,
-        )
-
         # 7. Node 5: Reporter (Deterministic Reconciliation, Suppression, Redaction)
         review_complete = (
             paired_res.review_complete
@@ -974,6 +983,14 @@ class FrozenEvaluationHarness:
             or (det_res.error is not None)
             or scan_output.any_tool_failed
         )
+
+        if infrastructure_failure:
+            print(
+                f"[INFRA_FAIL] {fixture.fixture_id}: paired_complete={paired_res.review_complete}, "
+                f"raw_errs={paired_res.raw_result.errors}, stripped_errs={paired_res.stripped_result.errors}, "
+                f"det_error={det_res.error}, scan_any_fail={scan_output.any_tool_failed}",
+                flush=True,
+            )
 
         reporter = Node5Reporter(canary_config=canary_conf)
         return reporter.generate_final_report(

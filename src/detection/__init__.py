@@ -65,17 +65,6 @@ from src.detection.nim_provider import (
     NIMProvider,
     NIMRateLimitError,
 )
-from src.detection.openrouter_provider import (
-    OpenRouterCanaryInspectionError,
-    OpenRouterConfig,
-    OpenRouterCreditsExhaustedError,
-    OpenRouterError,
-    OpenRouterInvalidOutputError,
-    OpenRouterModelUnavailableError,
-    OpenRouterOversizedInputError,
-    OpenRouterProvider,
-    OpenRouterRateLimitError,
-)
 from src.detection.context_budget import (
     ChunkPlan,
     ContextBudgetConfig,
@@ -127,15 +116,6 @@ __all__ = [
     "NIMOversizedInputError",
     "NIMProvider",
     "NIMRateLimitError",
-    "OpenRouterCanaryInspectionError",
-    "OpenRouterConfig",
-    "OpenRouterCreditsExhaustedError",
-    "OpenRouterError",
-    "OpenRouterInvalidOutputError",
-    "OpenRouterModelUnavailableError",
-    "OpenRouterOversizedInputError",
-    "OpenRouterProvider",
-    "OpenRouterRateLimitError",
     "NODE4_SYSTEM_PROMPT",
     "Node4InjectionDetector",
     "Node3PairedReviewer",

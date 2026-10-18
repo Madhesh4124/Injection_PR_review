@@ -126,6 +126,10 @@ class OllamaConfig(BaseModel):
         le=131072,
         description="Context window size allocated in tokens (e.g. 32768, preventing silent 2048-token truncation).",
     )
+    format: Optional[Union[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="Constrained output format for Ollama (e.g. 'json' or JSON schema).",
+    )
 
     @property
     def max_attempts(self) -> int:
@@ -148,6 +152,7 @@ class OllamaConfig(BaseModel):
             max_input_bytes=int(os.getenv("OLLAMA_MAX_INPUT_BYTES", "175000")),
             max_output_bytes=int(os.getenv("OLLAMA_MAX_OUTPUT_BYTES", "100000")),
             num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "32768")),
+            format=os.getenv("OLLAMA_FORMAT", None),
         )
 
 
@@ -463,6 +468,7 @@ class OllamaProvider(LLMProvider):
             if self.config.num_ctx is not None:
                 options["num_ctx"] = self.config.num_ctx
 
+            format_spec = kwargs.get("format", self.config.format)
             payload = {
                 "model": self.config.model_name,
                 "prompt": prompt,
@@ -470,6 +476,8 @@ class OllamaProvider(LLMProvider):
                 "stream": False,
                 "options": options,
             }
+            if format_spec is not None:
+                payload["format"] = format_spec
             payload_bytes = json.dumps(payload).encode("utf-8")
 
             # Final dispatch boundary inspection immediately before dispatch
