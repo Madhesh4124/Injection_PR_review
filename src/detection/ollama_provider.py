@@ -355,6 +355,24 @@ class OllamaProvider(LLMProvider):
             model_name=self.config.model_name,
         )
 
+    def _invoke_transport(
+        self,
+        transport_fn: Callable[..., str],
+        wire_bytes: bytes,
+        wire_payload: Dict[str, Any],
+        timeout: float,
+    ) -> str:
+        """Invoke injectable transport callable with deterministic signature resolution."""
+        import inspect
+
+        sig = inspect.signature(transport_fn)
+        params = list(sig.parameters.values())
+        if len(params) == 1:
+            return transport_fn(wire_bytes)
+        if params and params[0].annotation in (dict, Dict[str, Any], "dict", "Dict[str, Any]"):
+            return transport_fn(wire_payload, timeout)
+        return transport_fn(wire_bytes, timeout)
+
     def complete(
         self,
         prompt: str,
@@ -509,6 +527,63 @@ class OllamaProvider(LLMProvider):
                     )
                     raise OllamaCanaryInspectionError(clean_msg)
 
+            # 3b. Wire-dispatch canary sanitization & fail-closed verification
+            from src.detection.canary_telemetry import ExposureState
+
+            wire_payload_bytes = payload_bytes
+            wire_payload_dict = payload
+
+            if (
+                inspection_record is not None
+                and inspection_record.exposure_state == ExposureState.CONFIRMED_EXPOSURE
+            ):
+                try:
+                    from src.reporting.canary_redactor import CanaryConfig, CanaryRedactor
+
+                    target_canaries = getattr(self.dispatch_inspector, "target_canaries", None)
+                    if target_canaries and len(target_canaries) > 0:
+                        canary_cfg = CanaryConfig(
+                            synthetic_canary=target_canaries[0],
+                            additional_canaries=list(target_canaries[1:]),
+                        )
+                    else:
+                        canary_cfg = CanaryConfig()
+
+                    redactor = CanaryRedactor(canary_cfg)
+
+                    # Redact prompt field
+                    sanitized_prompt, _ = redactor.scan_and_redact_text(prompt)
+
+                    # Redact system field if present
+                    sanitized_system = ""
+                    if system_prompt:
+                        sanitized_system, _ = redactor.scan_and_redact_text(system_prompt)
+
+                    wire_payload_dict = dict(payload)
+                    wire_payload_dict["prompt"] = sanitized_prompt
+                    if system_prompt:
+                        wire_payload_dict["system"] = sanitized_system
+
+                    wire_payload_bytes = json.dumps(wire_payload_dict).encode("utf-8")
+
+                    # Fail-closed post-redaction verification:
+                    # Confirm no raw configured canary token exists in the serialized wire payload
+                    wire_payload_text = wire_payload_bytes.decode("utf-8", errors="replace")
+                    all_configured_tokens = [canary_cfg.synthetic_canary] + canary_cfg.additional_canaries
+                    for token in all_configured_tokens:
+                        if token and token.lower() in wire_payload_text.lower():
+                            raise OllamaCanaryInspectionError(
+                                f"Canary wire-dispatch verification failed: raw canary secret '{token}' detected in post-sanitization wire payload; "
+                                "outgoing request blocked fail-closed."
+                            )
+                except Exception as exc:
+                    if isinstance(exc, OllamaCanaryInspectionError):
+                        raise
+                    raise OllamaCanaryInspectionError(
+                        f"Canary wire-dispatch sanitization failed ({type(exc).__name__}: {exc}); "
+                        "outgoing request blocked fail-closed."
+                    ) from exc
+
             attempt = 0
             last_error: Optional[Exception] = None
 
@@ -523,13 +598,15 @@ class OllamaProvider(LLMProvider):
 
                 try:
                     if self._transport_fn is not None:
-                        try:
-                            content = self._transport_fn(payload_bytes, remaining_request_timeout)
-                        except TypeError:
-                            content = self._transport_fn(payload, remaining_request_timeout)
+                        content = self._invoke_transport(
+                            self._transport_fn,
+                            wire_payload_bytes,
+                            wire_payload_dict,
+                            remaining_request_timeout,
+                        )
                     else:
                         content = self._default_http_transport(
-                            payload_bytes, remaining_request_timeout, deadline
+                            wire_payload_bytes, remaining_request_timeout, deadline
                         )
 
                     # Mark inspection record as successfully dispatched over wire
