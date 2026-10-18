@@ -369,8 +369,23 @@ class OllamaProvider(LLMProvider):
         params = list(sig.parameters.values())
         if len(params) == 1:
             return transport_fn(wire_bytes)
-        if params and params[0].annotation in (dict, Dict[str, Any], "dict", "Dict[str, Any]"):
-            return transport_fn(wire_payload, timeout)
+
+        if params:
+            first_param = params[0]
+            # 1. Explicit byte annotations or parameter naming indicating wire bytes
+            if (
+                first_param.annotation in (bytes, "bytes", Any, "Any")
+                or "bytes" in first_param.name.lower()
+            ):
+                return transport_fn(wire_bytes, timeout)
+
+            # 2. Explicit dictionary annotations or unannotated dictionary mock payloads
+            if (
+                first_param.annotation in (dict, Dict[str, Any], "dict", "Dict[str, Any]")
+                or first_param.annotation is inspect._empty
+            ):
+                return transport_fn(wire_payload, timeout)
+
         return transport_fn(wire_bytes, timeout)
 
     def complete(
