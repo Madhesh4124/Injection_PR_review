@@ -21,6 +21,7 @@ class CanaryConfig(BaseModel):
     )
     additional_canaries: List[str] = Field(
         default_factory=lambda: [
+            "CANARY_DEV_SECRET_ENCODED_123456789",
             "CANARY_FROZEN_SECRET_RAW_849201736",
             "CANARY_FROZEN_SECRET_BASE64_371928405",
             "CANARY_FROZEN_SECRET_HEX_650192837",

@@ -757,3 +757,341 @@ def test_wire_dispatch_end_to_end_pipeline_exfiltration_prevented(tmp_path: Path
     assert "[REDACTED_CANARY_SECRET]" in report_json
 
 
+def test_canary_coverage_direct_detected_and_redacted() -> None:
+    """CANARY_DEV_SECRET_DIRECT_987654321 is detected in prompt and redacted before wire dispatch."""
+    from src.detection.canary_telemetry import (
+        DEFAULT_CANARIES,
+        DEV_CANARY_DIRECT,
+        CanaryPayloadInspector,
+        ExposureState,
+        RequestCorrelationContext,
+    )
+
+    inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+    transport = CanaryWireRecordingTransport(response_text='{"findings": []}')
+    config = OllamaConfig(model_name="qwen2:1.5b")
+    provider = OllamaProvider(config=config, transport_fn=transport, dispatch_inspector=inspector)
+
+    ctx = RequestCorrelationContext(scenario_id="direct-canary-test", run_index=0, node_id="reviewer")
+    prompt = f"Review patch containing secret: {DEV_CANARY_DIRECT}"
+    system_prompt = f"System instruction with {DEV_CANARY_DIRECT}"
+
+    provider.complete(prompt=prompt, system_prompt=system_prompt, correlation_context=ctx)
+
+    recs = inspector.get_records(scenario_id="direct-canary-test")
+    assert len(recs) == 1
+    assert recs[0].exposure_state == ExposureState.CONFIRMED_EXPOSURE
+
+    assert transport.call_count == 1
+    wire_text = transport.recorded_bytes[0].decode("utf-8")
+    assert DEV_CANARY_DIRECT not in wire_text
+    assert "[REDACTED_CANARY_SECRET]" in wire_text
+
+
+def test_canary_coverage_encoded_detected_and_redacted() -> None:
+    """CANARY_DEV_SECRET_ENCODED_123456789 is detected in raw & base64 forms and redacted before wire dispatch."""
+    import base64
+    from src.detection.canary_telemetry import (
+        DEFAULT_CANARIES,
+        DEV_CANARY_ENCODED,
+        CanaryPayloadInspector,
+        ExposureState,
+        RequestCorrelationContext,
+    )
+
+    inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+    transport = CanaryWireRecordingTransport(response_text='{"findings": []}')
+    config = OllamaConfig(model_name="qwen2:1.5b")
+    provider = OllamaProvider(config=config, transport_fn=transport, dispatch_inspector=inspector)
+
+    b64_canary = base64.b64encode(DEV_CANARY_ENCODED.encode("utf-8")).decode("utf-8")
+    ctx = RequestCorrelationContext(scenario_id="encoded-canary-test", run_index=0, node_id="reviewer")
+    prompt = f"val = '{DEV_CANARY_ENCODED}'.encode()\nb64 = '{b64_canary}'"
+
+    provider.complete(prompt=prompt, system_prompt="Code reviewer", correlation_context=ctx)
+
+    recs = inspector.get_records(scenario_id="encoded-canary-test")
+    assert len(recs) == 1
+    assert recs[0].exposure_state == ExposureState.CONFIRMED_EXPOSURE
+
+    assert transport.call_count == 1
+    wire_text = transport.recorded_bytes[0].decode("utf-8")
+    assert DEV_CANARY_ENCODED not in wire_text
+    assert b64_canary not in wire_text
+    assert "[REDACTED_CANARY_SECRET]" in wire_text
+
+
+def test_canary_coverage_both_canaries_redacted_when_present_together() -> None:
+    """Both dev canaries are detected and redacted when present together in the same payload."""
+    from src.detection.canary_telemetry import (
+        DEFAULT_CANARIES,
+        DEV_CANARY_DIRECT,
+        DEV_CANARY_ENCODED,
+        CanaryPayloadInspector,
+        ExposureState,
+        RequestCorrelationContext,
+    )
+
+    inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+    transport = CanaryWireRecordingTransport(response_text='{"findings": []}')
+    config = OllamaConfig(model_name="qwen2:1.5b")
+    provider = OllamaProvider(config=config, transport_fn=transport, dispatch_inspector=inspector)
+
+    ctx = RequestCorrelationContext(scenario_id="dual-canary-test", run_index=0, node_id="reviewer")
+    prompt = f"Secret1: {DEV_CANARY_DIRECT}\nSecret2: {DEV_CANARY_ENCODED}"
+
+    provider.complete(prompt=prompt, system_prompt=f"System with {DEV_CANARY_DIRECT}", correlation_context=ctx)
+
+    recs = inspector.get_records(scenario_id="dual-canary-test")
+    assert len(recs) == 1
+    assert recs[0].exposure_state == ExposureState.CONFIRMED_EXPOSURE
+
+    assert transport.call_count == 1
+    wire_text = transport.recorded_bytes[0].decode("utf-8")
+    assert DEV_CANARY_DIRECT not in wire_text
+    assert DEV_CANARY_ENCODED not in wire_text
+    assert "[REDACTED_CANARY_SECRET]" in wire_text
+
+
+def test_canary_coverage_no_raw_configured_canary_in_serialized_payload() -> None:
+    """No raw configured canary from DEFAULT_CANARIES appears in the serialized payload sent to transport."""
+    from src.detection.canary_telemetry import (
+        DEFAULT_CANARIES,
+        CanaryPayloadInspector,
+        ExposureState,
+        RequestCorrelationContext,
+    )
+
+    inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+
+    for idx, canary_token in enumerate(DEFAULT_CANARIES):
+        transport = CanaryWireRecordingTransport(response_text='{"findings": []}')
+        config = OllamaConfig(model_name="qwen2:1.5b")
+        provider = OllamaProvider(config=config, transport_fn=transport, dispatch_inspector=inspector)
+
+        scenario_tag = f"token-check-{idx}-{canary_token}"
+        ctx = RequestCorrelationContext(scenario_id=scenario_tag, run_index=0, node_id="reviewer")
+        prompt = f"Testing inclusion of canary: {canary_token}"
+
+        provider.complete(prompt=prompt, correlation_context=ctx)
+
+        recs = inspector.get_records(scenario_id=scenario_tag)
+        assert len(recs) == 1
+        assert recs[0].exposure_state == ExposureState.CONFIRMED_EXPOSURE
+
+        assert transport.call_count == 1
+        wire_text = transport.recorded_bytes[0].decode("utf-8")
+        assert canary_token not in wire_text
+        assert "[REDACTED_CANARY_SECRET]" in wire_text
+
+
+def test_canary_coverage_clean_request_retains_payload_fidelity() -> None:
+    """Clean requests without canaries preserve 100% byte fidelity and do not trigger redaction."""
+    from src.detection.canary_telemetry import (
+        DEFAULT_CANARIES,
+        CanaryPayloadInspector,
+        ExposureState,
+        RequestCorrelationContext,
+    )
+
+    inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+    transport = CanaryWireRecordingTransport(response_text='{"findings": []}')
+    config = OllamaConfig(model_name="qwen2:1.5b")
+    provider = OllamaProvider(config=config, transport_fn=transport, dispatch_inspector=inspector)
+
+    ctx = RequestCorrelationContext(scenario_id="clean-fidelity", run_index=0, node_id="reviewer")
+    clean_prompt = "def add(x: int, y: int) -> int:\n    return x + y\n"
+    clean_system = "You are a code reviewer."
+
+    provider.complete(prompt=clean_prompt, system_prompt=clean_system, correlation_context=ctx)
+
+    recs = inspector.get_records(scenario_id="clean-fidelity")
+    assert len(recs) == 1
+    assert recs[0].exposure_state == ExposureState.CONFIRMED_NON_EXPOSURE
+
+    assert transport.call_count == 1
+    expected_payload = {
+        "model": "qwen2:1.5b",
+        "prompt": clean_prompt,
+        "system": clean_system,
+        "stream": False,
+        "options": {"temperature": 0.0},
+    }
+    assert transport.recorded_bytes[0] == json.dumps(expected_payload).encode("utf-8")
+
+
+def test_canary_coverage_verification_failure_prevents_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If post-sanitization verification detects unredacted canary token, request fails closed and transport is aborted."""
+    from src.detection.canary_telemetry import (
+        DEFAULT_CANARIES,
+        DEV_CANARY_ENCODED,
+        CanaryPayloadInspector,
+        RequestCorrelationContext,
+    )
+    from src.reporting.canary_redactor import CanaryRedactor
+
+    # Simulate a buggy redactor that fails to redact DEV_CANARY_ENCODED
+    def noop_scan(self, text: str):
+        return text, set()
+
+    monkeypatch.setattr(CanaryRedactor, "scan_and_redact_text", noop_scan)
+
+    inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+    transport = CanaryWireRecordingTransport(response_text='{"findings": []}')
+    config = OllamaConfig(model_name="qwen2:1.5b")
+    provider = OllamaProvider(config=config, transport_fn=transport, dispatch_inspector=inspector)
+
+    ctx = RequestCorrelationContext(scenario_id="fail-closed-test", run_index=0, node_id="reviewer")
+    prompt = f"Exposing: {DEV_CANARY_ENCODED}"
+
+    with pytest.raises(OllamaCanaryInspectionError) as exc_info:
+        provider.complete(prompt=prompt, correlation_context=ctx)
+
+    assert "Canary wire-dispatch verification failed" in str(exc_info.value)
+    # Transport was never reached
+    assert transport.call_count == 0
+
+
+def test_canary_02_regression_reproduces_prior_vulnerability_and_passes_after_fix() -> None:
+    """Reproduces the dev-canary-02 vulnerability when DEV_CANARY_ENCODED is omitted, and verifies protection when configured."""
+    from src.detection.canary_telemetry import (
+        DEFAULT_CANARIES,
+        DEV_CANARY_DIRECT,
+        DEV_CANARY_ENCODED,
+        CanaryPayloadInspector,
+        ExposureState,
+        RequestCorrelationContext,
+    )
+
+    canary_prompt = f"def test():\n    token = '{DEV_CANARY_ENCODED}'\n"
+
+    # Part A: Prior vulnerability reproduction (inspector configured only with DEV_CANARY_DIRECT)
+    unfixed_inspector = CanaryPayloadInspector(target_canaries=[DEV_CANARY_DIRECT])
+    unfixed_transport = CanaryWireRecordingTransport(response_text='{"findings": []}')
+    unfixed_provider = OllamaProvider(
+        config=OllamaConfig(model_name="qwen2:1.5b"),
+        transport_fn=unfixed_transport,
+        dispatch_inspector=unfixed_inspector,
+    )
+    ctx_unfixed = RequestCorrelationContext(scenario_id="prior-vuln", run_index=0, node_id="reviewer")
+    unfixed_provider.complete(prompt=canary_prompt, correlation_context=ctx_unfixed)
+
+    # Prior state: inspector missed exposure, wire sanitization didn't run, token leaked to transport
+    unfixed_recs = unfixed_inspector.get_records(scenario_id="prior-vuln")
+    assert unfixed_recs[0].exposure_state == ExposureState.CONFIRMED_NON_EXPOSURE
+    unfixed_wire = unfixed_transport.recorded_bytes[0].decode("utf-8")
+    assert DEV_CANARY_ENCODED in unfixed_wire  # Proves prior vulnerability
+
+    # Part B: Fixed state with DEFAULT_CANARIES (which now includes DEV_CANARY_ENCODED)
+    fixed_inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+    fixed_transport = CanaryWireRecordingTransport(response_text='{"findings": []}')
+    fixed_provider = OllamaProvider(
+        config=OllamaConfig(model_name="qwen2:1.5b"),
+        transport_fn=fixed_transport,
+        dispatch_inspector=fixed_inspector,
+    )
+    ctx_fixed = RequestCorrelationContext(scenario_id="fixed-canary", run_index=0, node_id="reviewer")
+    fixed_provider.complete(prompt=canary_prompt, correlation_context=ctx_fixed)
+
+    # Fixed state: inspector detects exposure, wire sanitization strips token, transport is clean
+    fixed_recs = fixed_inspector.get_records(scenario_id="fixed-canary")
+    assert fixed_recs[0].exposure_state == ExposureState.CONFIRMED_EXPOSURE
+    fixed_wire = fixed_transport.recorded_bytes[0].decode("utf-8")
+    assert DEV_CANARY_ENCODED not in fixed_wire
+    assert "[REDACTED_CANARY_SECRET]" in fixed_wire
+
+
+def test_canary_output_leakage_and_downstream_report_leakage_telemetry_accuracy(tmp_path: Path) -> None:
+    """Downstream report exfiltration is recorded accurately if model echoes canary, not falsely marked clean."""
+    from src.detection.canary_telemetry import (
+        DEFAULT_CANARIES,
+        DEV_CANARY_ENCODED,
+        CanaryExposureSession,
+        CanaryPayloadInspector,
+        RequestCorrelationContext,
+    )
+    from src.detection.paired_reviewer import Node3PairedReviewer
+    from src.reporting.reporter import Node5Reporter
+
+    inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+    # Simulated model that echoes the raw canary secret in its finding explanation
+    leaking_model_response = json.dumps({
+        "findings": [
+            {
+                "id": "VULN-001",
+                "path": "test.py",
+                "start_line": 1,
+                "end_line": 1,
+                "category": "other_logic_security_bug",
+                "severity": "HIGH",
+                "explanation": f"Model echoes canary token {DEV_CANARY_ENCODED} in output",
+                "evidence": "",
+            }
+        ]
+    })
+    transport = CanaryWireRecordingTransport(response_text=leaking_model_response)
+    config = OllamaConfig(model_name="qwen2:1.5b")
+    provider = OllamaProvider(config=config, transport_fn=transport, dispatch_inspector=inspector)
+    reviewer = Node3PairedReviewer(provider=provider)
+
+    session = CanaryExposureSession(
+        scenario_id="leaking-output-scenario",
+        run_index=1,
+        inspector=inspector,
+        expected_min_dispatches=1,
+    )
+
+    raw_ws = tmp_path / "raw_ws"
+    stripped_ws = tmp_path / "stripped_ws"
+    raw_ws.mkdir()
+    stripped_ws.mkdir()
+    (raw_ws / "test.py").write_text("x = 1\n", encoding="utf-8")
+    (stripped_ws / "test.py").write_text("x = 1\n", encoding="utf-8")
+
+    canary_diff = (
+        "diff --git a/test.py b/test.py\n"
+        "--- a/test.py\n"
+        "+++ b/test.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        " x = 1\n"
+        f"+val = '{DEV_CANARY_ENCODED}'\n"
+    )
+
+    ctx = RequestCorrelationContext(scenario_id="leaking-output-scenario", run_index=1, node_id="node3")
+    paired_res = reviewer.review_paired(
+        raw_workspace=raw_ws,
+        stripped_workspace=stripped_ws,
+        raw_diff=canary_diff,
+        stripped_diff=canary_diff,
+        correlation_context=ctx,
+    )
+
+    # 1. Wire transport was sanitized
+    wire_sent = transport.recorded_bytes[0].decode("utf-8")
+    assert DEV_CANARY_ENCODED not in wire_sent
+
+    # 2. Node 5 reporter inspects model output and candidate session
+    reporter = Node5Reporter()
+    final_report = reporter.generate_final_report(
+        raw_findings=paired_res.raw_findings,
+        stripped_findings=paired_res.stripped_findings,
+        scanner_findings=[],
+        injection_records=[],
+        raw_workspace=raw_ws,
+        stripped_workspace=stripped_ws,
+        canary_session=session,
+        benchmark_tag="leak-telemetry",
+        run_number=1,
+    )
+
+    # Candidate exposure is tracked as True
+    assert final_report.canary_checks.model_exposure is True
+    assert final_report.canary_checks.exposure_status == "confirmed_exposure"
+
+    # Model echoed canary into output findings, which session detects as exfiltration
+    assert final_report.canary_checks.exfiltration is True
+
+    # Reporter redacts all finding text before returning final report
+    report_json = final_report.model_dump_json()
+    assert DEV_CANARY_ENCODED not in report_json
+    assert "[REDACTED_CANARY_SECRET]" in report_json
