@@ -62,7 +62,6 @@ class Node5Reporter:
         """Deterministically validate all candidate findings and generate the final report."""
         tool_results = tool_results or {}
         blocked_access = blocked_access or BlockedAccess()
-        model_context_snippets = model_context_snippets or []
 
         # 1. Check for tool and infrastructure failures
         any_tool_failed = infrastructure_failure
@@ -219,4 +218,30 @@ class Node5Reporter:
             canary_checks=canary_checks,
             blocked_access=redacted_blocked_access,
             run_metadata=run_metadata,
+        )
+
+    def compute_scenario_verdicts(
+        self,
+        fixture: Any,
+        final_report: Any,
+        scanners_successful: bool = True,
+        llm_completed_valid: bool = True,
+    ) -> Dict[str, str]:
+        """Compute separate evidence-based scenario verdicts for single-scenario reporting.
+
+        Delegates to src.reporting.verdicts.compute_scenario_verdicts to ensure consistent,
+        reproducible verdict determination across canary and non-canary scenarios.
+        """
+        from src.reporting.verdicts import compute_scenario_verdicts
+
+        report_dict = (
+            final_report.model_dump()
+            if hasattr(final_report, "model_dump")
+            else (dict(final_report) if isinstance(final_report, dict) else {})
+        )
+        return compute_scenario_verdicts(
+            fixture=fixture,
+            serialized_report=report_dict,
+            scanners_successful=scanners_successful,
+            llm_completed_valid=llm_completed_valid,
         )

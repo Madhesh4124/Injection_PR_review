@@ -535,3 +535,31 @@ def test_worker_thread_timeout_recovers_concurrency_and_subsequent_request():
     assert resp.content == '{"records": []}'
 
 
+def test_num_predict_configuration_and_call_precedence():
+    """Verify num_predict precedence: call kwarg > options dict > config attribute."""
+    captured = {}
+
+    def capture_transport(payload, timeout):
+        captured["options"] = dict(payload.get("options", {}))
+        return '{"records": []}'
+
+    # 1. Config default None: num_predict not set in options
+    p1 = OllamaProvider(config=OllamaConfig(), transport_fn=capture_transport)
+    p1.complete("test prompt")
+    assert "num_predict" not in captured["options"]
+
+    # 2. Config has num_predict=100
+    p2 = OllamaProvider(config=OllamaConfig(num_predict=100), transport_fn=capture_transport)
+    p2.complete("test prompt")
+    assert captured["options"]["num_predict"] == 100
+
+    # 3. Call options dict overrides config
+    p2.complete("test prompt", options={"num_predict": 200})
+    assert captured["options"]["num_predict"] == 200
+
+    # 4. Explicit call kwarg overrides both config and options dict
+    p2.complete("test prompt", options={"num_predict": 200}, num_predict=256)
+    assert captured["options"]["num_predict"] == 256
+
+
+

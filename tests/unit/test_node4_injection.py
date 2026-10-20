@@ -532,3 +532,20 @@ def test_waiver_injection_deduplication() -> None:
     assert len(result.records) == 1
     assert result.records[0].id == "INJ-LLM-01"
 
+
+def test_node4_prompt_conciseness_and_schema_rules() -> None:
+    """Verify that NODE4_SYSTEM_PROMPT enforces concise evidence, explanations, and token economy."""
+    from src.detection.prompts import NODE4_SYSTEM_PROMPT
+
+    # Evidence under 50 characters
+    assert "under 50 characters" in NODE4_SYSTEM_PROMPT
+    # Explanation under 80 characters
+    assert "under 80 characters" in NODE4_SYSTEM_PROMPT
+    # Token economy instruction
+    assert "STRICT TOKEN ECONOMY" in NODE4_SYSTEM_PROMPT
+    # Exact 4 injection types defined
+    for inj_type in ("direct_instruction", "authority_claim", "hidden_unicode", "plausible_justification"):
+        assert inj_type in NODE4_SYSTEM_PROMPT
+    # Valid JSON instructions
+    assert 'Output ONLY the single top-level JSON object: {"records": [...]}' in NODE4_SYSTEM_PROMPT
+

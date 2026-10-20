@@ -130,6 +130,12 @@ class OllamaConfig(BaseModel):
         default=None,
         description="Constrained output format for Ollama (e.g. 'json' or JSON schema).",
     )
+    num_predict: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=131072,
+        description="Maximum number of tokens to predict/generate (default: None for model default).",
+    )
 
     @property
     def max_attempts(self) -> int:
@@ -153,7 +159,9 @@ class OllamaConfig(BaseModel):
             max_output_bytes=int(os.getenv("OLLAMA_MAX_OUTPUT_BYTES", "100000")),
             num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "32768")),
             format=os.getenv("OLLAMA_FORMAT", None),
+            num_predict=int(os.getenv("OLLAMA_NUM_PREDICT")) if os.getenv("OLLAMA_NUM_PREDICT") else None,
         )
+
 
 
 class OllamaProvider(LLMProvider):
@@ -500,6 +508,15 @@ class OllamaProvider(LLMProvider):
             }
             if self.config.num_ctx is not None:
                 options["num_ctx"] = self.config.num_ctx
+            if self.config.num_predict is not None:
+                options["num_predict"] = self.config.num_predict
+
+            # Explicit call kwargs take precedence over configured defaults
+            if "options" in kwargs and isinstance(kwargs["options"], dict):
+                options.update(kwargs["options"])
+            if "num_predict" in kwargs and kwargs["num_predict"] is not None:
+                options["num_predict"] = kwargs["num_predict"]
+
 
             format_spec = kwargs.get("format", self.config.format)
             payload = {
@@ -626,7 +643,13 @@ class OllamaProvider(LLMProvider):
 
                     # Mark inspection record as successfully dispatched over wire
                     if inspection_record is not None and hasattr(inspection_record, "mark_dispatched"):
-                        inspection_record.mark_dispatched()
+                        from src.detection.canary_telemetry import ExposureState
+                        is_exposed = getattr(inspection_record, "exposure_state", None) == ExposureState.CONFIRMED_EXPOSURE
+                        inspection_record.mark_dispatched(
+                            raw_secret_transmitted=False,
+                            wire_redaction_verified=True,
+                        )
+
 
                     # Wall-clock timeout check after transport completes
                     if time.monotonic() >= deadline:

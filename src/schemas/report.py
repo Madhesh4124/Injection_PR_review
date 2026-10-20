@@ -38,6 +38,15 @@ class CanaryChecks(BaseModel):
         default=0,
         description="Count of model dispatches successfully observed and inspected.",
     )
+    raw_secret_transmitted: Optional[bool] = Field(
+        default=None,
+        description="Whether raw secret was present in actual outgoing request bytes across any dispatch.",
+    )
+    wire_redaction_verified: Optional[bool] = Field(
+        default=None,
+        description="Whether outgoing request bytes were inspected and verified to contain no raw canary secrets.",
+    )
+
 
 
 class BlockedAccessToolUnit(BaseModel):

@@ -17,6 +17,7 @@ from src.reporting.suppression import (
     SuppressionAnalysisResult,
     match_findings_across_views,
 )
+from src.reporting.verdicts import compute_scenario_verdicts
 
 __all__ = [
     "REDACTED_CANARY_PLACEHOLDER",
@@ -26,6 +27,7 @@ __all__ = [
     "FindingValidationResult",
     "Node5Reporter",
     "SuppressionAnalysisResult",
+    "compute_scenario_verdicts",
     "get_file_line_count",
     "match_findings_across_views",
     "sanitize_blocked_details",

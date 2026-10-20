@@ -11,6 +11,7 @@ Evaluation Protocol:
 - Generates structured machine-readable JSON reports and formatted markdown tables.
 """
 
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -19,6 +20,8 @@ import tempfile
 import time
 from typing import Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
+
+logger = logging.getLogger(__name__)
 
 from src.detection.detector import Node4InjectionDetector
 from src.detection.paired_reviewer import Node3PairedReviewer
@@ -72,6 +75,10 @@ class EvaluationConfig(BaseModel):
     use_simulation: bool = Field(
         default=False,
         description="Explicit simulation flag for running offline tests without real LLM calls.",
+    )
+    use_langgraph_pipeline: bool = Field(
+        default=False,
+        description="When True, routes defended fixture execution through the LangGraph pipeline.",
     )
 
 
@@ -872,6 +879,101 @@ class FrozenEvaluationHarness:
         run_dir: Path,
     ) -> FinalReport:
         """Run defended 5-node security pipeline with real Nodes 1-5."""
+        if getattr(self.config, "use_langgraph_pipeline", False):
+            return self._run_defended_fixture_graph(fixture, run_idx, run_dir)
+        return self._run_defended_fixture_legacy(fixture, run_idx, run_dir)
+
+    def _run_defended_fixture_graph(
+        self,
+        fixture: FixtureDefinition,
+        run_idx: int,
+        run_dir: Path,
+    ) -> FinalReport:
+        """Run defended 5-node security pipeline via LangGraph sequential DAG."""
+        if self.config.use_simulation:
+            return self._run_defended_fixture_simulated(fixture, run_idx, run_dir)
+
+        if self.provider is None:
+            raise ValueError(
+                f"Cannot execute live defended evaluation for fixture '{fixture.fixture_id}': "
+                "no LLMProvider was initialized and config.use_simulation is False. "
+                "Initialize a valid LLMProvider or explicitly set config.use_simulation=True."
+            )
+
+        from src.workflow import build_review_graph, ReviewGraphState
+
+        inspector = None
+        session = None
+        orig_inspector = getattr(self.provider, "dispatch_inspector", None)
+        try:
+            from src.detection.canary_telemetry import (
+                DEFAULT_CANARIES,
+                CanaryExposureSession,
+                CanaryPayloadInspector,
+            )
+            from src.detection.context_budget import plan_review_chunks
+            chunk_plan = plan_review_chunks(patch_content=fixture.patch_content)
+            req_chunks = len(chunk_plan.required_chunk_ids) if not chunk_plan.limit_breach else 1
+            expected_dispatches = (2 * req_chunks + 1) if fixture.scenario_category in (ScenarioCategory.TWIN, ScenarioCategory.CANARY) else 0
+
+            inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+            session = CanaryExposureSession(
+                scenario_id=fixture.fixture_id,
+                run_index=run_idx,
+                inspector=inspector,
+                expected_min_dispatches=expected_dispatches,
+            )
+            if hasattr(self.provider, "dispatch_inspector"):
+                self.provider.dispatch_inspector = inspector
+        except Exception as canary_init_err:
+            logger.warning(
+                "Canary payload inspector could not be initialized for graph runner: %s",
+                canary_init_err,
+            )
+
+        blocked_access = BlockedAccess(tool_unit=[], behavioral=[])
+        if fixture.scenario_category == ScenarioCategory.ACCESS_PROBE:
+            blocked_access = BlockedAccess(
+                tool_unit=[
+                    BlockedAccessToolUnit(
+                        attempt="unauthorized_path_traversal",
+                        blocked_by="path_containment_validator",
+                        details="Access outside authorized workspace boundaries blocked deterministically.",
+                    )
+                ],
+                behavioral=[],
+            )
+
+        try:
+            graph = build_review_graph(provider=self.provider)
+            initial_state: ReviewGraphState = {
+                "fixture_id": fixture.fixture_id,
+                "run_idx": run_idx,
+                "patch_content": fixture.patch_content,
+                "pr_description": fixture.pr_description,
+                "scenario_category": fixture.scenario_category.value,
+                "run_dir": run_dir,
+                "model_id": self.model_id,
+                "benchmark_tag": "frozen-defended",
+                "manifest_planted_bugs": getattr(fixture.manifest, "planted_bugs", []),
+                "canary_session": session,
+                "blocked_access": blocked_access,
+                "infrastructure_failure": False,
+                "pipeline_errors": [],
+            }
+            final_state = graph.invoke(initial_state)
+            return final_state["final_report"]
+        finally:
+            if hasattr(self.provider, "dispatch_inspector"):
+                self.provider.dispatch_inspector = orig_inspector
+
+    def _run_defended_fixture_legacy(
+        self,
+        fixture: FixtureDefinition,
+        run_idx: int,
+        run_dir: Path,
+    ) -> FinalReport:
+        """Legacy procedural defended 5-node security pipeline."""
         if self.config.use_simulation:
             return self._run_defended_fixture_simulated(fixture, run_idx, run_dir)
 
@@ -888,28 +990,80 @@ class FrozenEvaluationHarness:
         stripped_ws.mkdir(parents=True, exist_ok=True)
 
         # 1. Node 1: Materialize dual workspaces (Raw and Stripped)
-        patched_files = self._extract_files_from_diff(fixture.patch_content, fixture)
+        mat_error: Optional[str] = None
         readme_text: Optional[str] = None
-        for rel_path, content in patched_files.items():
-            fname = Path(rel_path).name
-            if re.match(r"^README(\.[a-zA-Z0-9]+)?$", fname, re.IGNORECASE):
-                # Raw view has README, stripped view omits README
-                readme_text = content
+        try:
+            patched_files = self._extract_files_from_diff(fixture.patch_content, fixture)
+            for rel_path, content in patched_files.items():
+                fname = Path(rel_path).name
+                if re.match(r"^README(\.[a-zA-Z0-9]+)?$", fname, re.IGNORECASE):
+                    # Raw view has README, stripped view omits README
+                    readme_text = content
+                    raw_target = raw_ws / rel_path
+                    raw_target.parent.mkdir(parents=True, exist_ok=True)
+                    raw_target.write_text(content, encoding="utf-8")
+                    continue
+
                 raw_target = raw_ws / rel_path
                 raw_target.parent.mkdir(parents=True, exist_ok=True)
                 raw_target.write_text(content, encoding="utf-8")
-                continue
 
-            raw_target = raw_ws / rel_path
-            raw_target.parent.mkdir(parents=True, exist_ok=True)
-            raw_target.write_text(content, encoding="utf-8")
+                stripped_target = stripped_ws / rel_path
+                stripped_target.parent.mkdir(parents=True, exist_ok=True)
+                stripped_bytes, _ = strip_file_content(content.encode("utf-8"), rel_path)
+                stripped_target.write_bytes(stripped_bytes)
+        except Exception as exc:
+            mat_error = str(exc)
+            logger.error(
+                "Legacy materialization failed for fixture '%s': %s",
+                fixture.fixture_id,
+                mat_error,
+            )
 
-            stripped_target = stripped_ws / rel_path
-            stripped_target.parent.mkdir(parents=True, exist_ok=True)
-            stripped_bytes, _ = strip_file_content(content.encode("utf-8"), rel_path)
-            stripped_target.write_bytes(stripped_bytes)
+        if mat_error is not None:
+            canary_conf = CanaryConfig()
+            session = None
+            try:
+                from src.detection.canary_telemetry import (
+                    DEFAULT_CANARIES,
+                    CanaryExposureSession,
+                    CanaryPayloadInspector,
+                )
+                inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
+                session = CanaryExposureSession(
+                    scenario_id=fixture.fixture_id,
+                    run_index=run_idx,
+                    inspector=inspector,
+                    expected_min_dispatches=1 if fixture.scenario_category in (ScenarioCategory.TWIN, ScenarioCategory.CANARY) else 0,
+                )
+            except Exception as canary_init_err:
+                logger.warning(
+                    "Canary payload inspector could not be initialized during materialization failure: %s. "
+                    "Proceeding with fail-closed report emission (zero dispatches occurred).",
+                    canary_init_err,
+                )
+                session = None
 
-        # 2. Node 2: Deterministic Static Analysis Scanners (pinned Bandit & Semgrep)
+            blocked_access = BlockedAccess(tool_unit=[], behavioral=[])
+            reporter = Node5Reporter(canary_config=canary_conf)
+            return reporter.generate_final_report(
+                raw_findings=[],
+                stripped_findings=[],
+                scanner_findings=[],
+                injection_records=[],
+                raw_workspace=raw_ws,
+                stripped_workspace=stripped_ws,
+                tool_results={},
+                blocked_access=blocked_access,
+                model_id=self.model_id,
+                benchmark_tag="frozen-defended",
+                run_number=run_idx + 1,
+                review_complete=False,
+                unreviewed_files_truncated=False,
+                infrastructure_failure=True,
+                model_context_snippets=None if session is None else [],
+                canary_session=session,
+            )
         # Pass actual scanner findings and tool results directly without ground-truth fallback
         scan_output = run_all_scanners(raw_ws)
         scanner_findings: List[ScannerFinding] = list(scan_output.scanner_findings)
@@ -921,12 +1075,17 @@ class FrozenEvaluationHarness:
             CanaryExposureSession,
             CanaryPayloadInspector,
         )
+        from src.detection.context_budget import plan_review_chunks
+        chunk_plan = plan_review_chunks(patch_content=fixture.patch_content)
+        req_chunks = len(chunk_plan.required_chunk_ids) if not chunk_plan.limit_breach else 1
+        expected_dispatches = (2 * req_chunks + 1) if fixture.scenario_category in (ScenarioCategory.TWIN, ScenarioCategory.CANARY) else 0
+
         inspector = CanaryPayloadInspector(target_canaries=DEFAULT_CANARIES)
         session = CanaryExposureSession(
             scenario_id=fixture.fixture_id,
             run_index=run_idx,
             inspector=inspector,
-            expected_min_dispatches=1 if fixture.scenario_category in (ScenarioCategory.TWIN, ScenarioCategory.CANARY) else 0,
+            expected_min_dispatches=expected_dispatches,
         )
 
         orig_inspector = getattr(self.provider, "dispatch_inspector", None)
@@ -943,6 +1102,8 @@ class FrozenEvaluationHarness:
                 stripped_diff=fixture.patch_content,
                 pr_description=fixture.pr_description,
                 readme_content=readme_text,
+                scenario_id=fixture.fixture_id,
+                run_index=run_idx,
             )
 
             # 4. Node 4: Structured Injection Detection
@@ -974,12 +1135,14 @@ class FrozenEvaluationHarness:
 
         # 7. Node 5: Reporter (Deterministic Reconciliation, Suppression, Redaction)
         review_complete = (
-            paired_res.review_complete
+            (mat_error is None)
+            and paired_res.review_complete
             and (det_res.error is None)
             and scan_output.all_tools_successful
         )
         infrastructure_failure = (
-            (not paired_res.review_complete)
+            (mat_error is not None)
+            or (not paired_res.review_complete)
             or (det_res.error is not None)
             or scan_output.any_tool_failed
         )
@@ -1169,64 +1332,10 @@ class FrozenEvaluationHarness:
         patch_content: str,
         fixture: Optional[FixtureDefinition] = None,
     ) -> Dict[str, str]:
-        file_patches = _split_diff_into_file_patches(patch_content)
-        extracted: Dict[str, str] = {}
-
-        for fp in file_patches:
-            target_path: Optional[str] = None
-            for line in fp:
-                if line.startswith("+++ b/"):
-                    target_path = line[6:].strip()
-                    break
-                elif line.startswith("+++ ") and not line.startswith("+++ /dev/null"):
-                    p = line[4:].strip()
-                    if p.startswith("b/"):
-                        p = p[2:]
-                    target_path = p
-                    break
-
-            if not target_path or target_path == "/dev/null":
-                continue
-
-            hunks: List[List[str]] = []
-            current_hunk: List[str] = []
-            for line in fp:
-                if line.startswith("@@ "):
-                    if current_hunk:
-                        hunks.append(current_hunk)
-                    current_hunk = [line]
-                elif current_hunk:
-                    current_hunk.append(line)
-            if current_hunk:
-                hunks.append(current_hunk)
-
-            lines: List[str] = []
-            curr_line = 1
-            for hunk in hunks:
-                try:
-                    old_start, old_count, new_start, new_count, ops = _parse_hunk(hunk)
-                except Exception:
-                    continue
-                while curr_line < new_start:
-                    lines.append("")
-                    curr_line += 1
-                for op, content in ops:
-                    if op in (" ", "+"):
-                        lines.append(content)
-                        curr_line += 1
-
-            if fixture:
-                max_end = max(
-                    [
-                        b.location.end_line
-                        for b in fixture.manifest.planted_bugs
-                        if b.location and b.location.path == target_path
-                    ]
-                    or [0]
-                )
-                while len(lines) < max_end + 5:
-                    lines.append("    pass")
-
-            extracted[target_path] = "\n".join(lines) + "\n"
-
-        return extracted
+        planted_bugs = (
+            getattr(fixture.manifest, "planted_bugs", [])
+            if fixture and hasattr(fixture, "manifest")
+            else []
+        )
+        from src.workflow.adapters import extract_files_from_diff
+        return extract_files_from_diff(patch_content, planted_bugs)
